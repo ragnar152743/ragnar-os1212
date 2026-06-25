@@ -3,7 +3,7 @@
 -- Everything important is clickable. Text fields still use the keyboard.
 
 local OS_NAME = "SecureClickOS"
-local VERSION = "1.16.0"
+local VERSION = "1.16.1"
 local ROOT = "/secureos"
 local STARTUP_PATH = "/startup.lua"
 local RECOVERY_DIR = "/.secureclickos"
@@ -39,6 +39,7 @@ local MAINT = {
   UPDATE_SOURCE_FILE = "secureclickos_update.lua",
   UPDATE_MANIFEST_FILE = "secureclickos_update.db",
   UPDATE_README_FILE = "SECURECLICKOS_UPDATE.txt",
+  GITHUB_UPDATE_URL = "https://raw.githubusercontent.com/ragnar152743/ragnar-os1212/refs/heads/main/startup.lua",
   STARTUP_UPDATE_BACKUP_FILE = "/startup.lua.before_update",
   CRASH_FILE = ROOT .. "/crash.db",
   CRASH_LIMIT = 3,
@@ -385,6 +386,8 @@ local function initStorage()
     bankPayProfile = nil,
     bankCashoutProfiles = {},
     externalStorage = true,
+    githubAutoUpdate = true,
+    githubUpdateUrl = MAINT.GITHUB_UPDATE_URL,
     showTips = true
   })
   if config.externalStorage == nil then config.externalStorage = true end
@@ -398,6 +401,8 @@ local function initStorage()
   if config.serverActivatedBy == nil then config.serverActivatedBy = "" end
   if type(config.bankPayProfile) ~= "table" then config.bankPayProfile = nil end
   if type(config.bankCashoutProfiles) ~= "table" then config.bankCashoutProfiles = {} end
+  if config.githubAutoUpdate == nil then config.githubAutoUpdate = true end
+  if type(config.githubUpdateUrl) ~= "string" or config.githubUpdateUrl == "" then config.githubUpdateUrl = MAINT.GITHUB_UPDATE_URL end
   users = loadTable(USERS_FILE, {})
   mail = loadTable(STORAGE.dataPath("mail.db", MAIL_FILE), { nextId = 1, boxes = {} })
   fileQueue = loadTable(STORAGE.dataPath("filequeue.db", FILE_QUEUE_FILE), { boxes = {} })
@@ -635,13 +640,15 @@ function MAINT.validateSecureClickOSSource(source)
   local markers = {
     "SecureClickOS for ComputerCraft",
     "local function integrityGate",
-    "local function hardenCraftOSSettings",
-    "local function main()"
+    "local function hardenCraftOSSettings"
   }
   for _, marker in ipairs(markers) do
     if not source:find(marker, 1, true) then
       return false, "Marqueur OS manquant: " .. marker
     end
+  end
+  if not source:find("local function main()", 1, true) and not source:find("function main()", 1, true) then
+    return false, "Marqueur OS manquant: main()"
   end
   return true, version
 end
@@ -2091,6 +2098,102 @@ function MAINT.installUpdateFromDisk(debugCode)
   print("Redemarrage dans 3 secondes.")
   if sleep then sleep(3) end
   os.reboot()
+end
+
+function MAINT.enableInternetAuto()
+  if not settings then return false, "settings indisponible" end
+  pcall(settings.set, "http.enabled", true)
+  pcall(settings.set, "http.websocket_enabled", true)
+  if settings.save then pcall(settings.save) end
+  if http and type(http.get) == "function" then return true end
+  return false, "HTTP indisponible; verifie la config serveur/modpack."
+end
+
+function MAINT.downloadGithubUpdate(url)
+  if not http or type(http.get) ~= "function" then
+    return false, "HTTP indisponible."
+  end
+  url = tostring(url or MAINT.GITHUB_UPDATE_URL)
+  local ok, response = pcall(http.get, url)
+  if not ok or not response then return false, "Telechargement GitHub impossible." end
+  local body = response.readAll and response.readAll() or ""
+  if response.close then response.close() end
+  if tostring(body or "") == "" then return false, "GitHub a renvoye un fichier vide." end
+  return true, body
+end
+
+function MAINT.installGithubSource(source, version, hash)
+  local tmp = STARTUP_PATH .. ".github_update"
+  if fs.exists(tmp) then fs.delete(tmp) end
+  if not rawWrite(tmp, source) then return false, "Ecriture temporaire impossible." end
+  if not constantTimeEquals(sha256(rawRead(tmp)), hash) then
+    if fs.exists(tmp) then fs.delete(tmp) end
+    return false, "Verification apres ecriture refusee."
+  end
+
+  local updateBackup = MAINT.STARTUP_UPDATE_BACKUP_FILE
+  local externalRoot = STORAGE.findExternal and STORAGE.findExternal()
+  if externalRoot and STORAGE.free(externalRoot) >= STORAGE.size(STARTUP_PATH) + STORAGE.MIN_FREE then
+    updateBackup = externalRoot .. "/startup.before_github_update"
+  end
+  if fs.exists(updateBackup) then fs.delete(updateBackup) end
+  if fs.exists(STARTUP_PATH) and STORAGE.free(updateBackup) >= STORAGE.size(STARTUP_PATH) + STORAGE.MIN_FREE then
+    pcall(fs.copy, STARTUP_PATH, updateBackup)
+  else
+    appendAudit("github update backup skipped: low space")
+  end
+  if fs.exists(STARTUP_PATH) then fs.delete(STARTUP_PATH) end
+  fs.move(tmp, STARTUP_PATH)
+  installSelfRecovery(true)
+  hardenCraftOSSettings()
+  appendAudit("github update installed version " .. tostring(version))
+  return true
+end
+
+function MAINT.checkGithubUpdateOnBoot()
+  if type(config) ~= "table" or config.githubAutoUpdate == false then return false, "GitHub update OFF" end
+  MAINT.enableInternetAuto()
+  local ok, sourceOrErr = MAINT.downloadGithubUpdate(config.githubUpdateUrl or MAINT.GITHUB_UPDATE_URL)
+  if not ok then
+    appendAudit("github update skipped: " .. tostring(sourceOrErr))
+    return false, sourceOrErr
+  end
+  local source = sourceOrErr
+  local valid, versionOrErr = MAINT.validateSecureClickOSSource(source)
+  if not valid then
+    appendAudit("github update refused: " .. tostring(versionOrErr))
+    return false, versionOrErr
+  end
+  local remoteHash = sha256(source)
+  local currentSource = rawRead(STARTUP_PATH)
+  if constantTimeEquals(remoteHash, sha256(currentSource)) then
+    return false, "Deja a jour."
+  end
+  local currentVersion = VERSION
+  local currentOk, installedVersion = MAINT.validSourceVersion(currentSource)
+  if currentOk and MAINT.compareVersions(installedVersion, currentVersion) > 0 then
+    currentVersion = installedVersion
+  end
+  if MAINT.compareVersions(versionOrErr, currentVersion) < 0 then
+    appendAudit("github update refused: downgrade " .. tostring(versionOrErr) .. " < " .. tostring(currentVersion))
+    return false, "Downgrade refuse."
+  end
+  local installed, err = MAINT.installGithubSource(source, versionOrErr, remoteHash)
+  if not installed then
+    appendAudit("github update failed: " .. tostring(err))
+    return false, err
+  end
+  pcall(term.setCursorBlink, false)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Mise a jour GitHub installee.")
+  print("Version: " .. tostring(versionOrErr))
+  print("Redemarrage dans 3 secondes.")
+  if sleep then sleep(3) end
+  os.reboot()
+  return true
 end
 
 function MAINT.uninstallSecureClickOS()
@@ -6189,6 +6292,7 @@ function appHelp()
       "- scan disque meme pendant crash/reboot",
       "- creation admin de disque recovery confirme",
       "- update debug signe depuis disque sans effacer /secureos",
+      "- update GitHub auto au boot si version valide",
       "- audit miroir rednet optionnel vers un PC dedie",
       "- verrouillage automatique",
       "- fichiers prives chiffres + MAC anti-modif",
@@ -6399,6 +6503,7 @@ function main()
   MAINT.safeBootStep("cleanup boot", function() STORAGE.emergencyCleanup("boot", 65536) end)
   MAINT.safeBootStep("config", function() initStorage() end)
   MAINT.safeBootStep("cleanup config", function() STORAGE.emergencyCleanup("boot-after-config", 65536) end)
+  MAINT.safeBootStep("github update", function() MAINT.checkGithubUpdateOnBoot() end)
   MAINT.safeBootStep("harden 2", function() hardenCraftOSSettings() end)
   MAINT.safeBootStep("rednet", function() tryOpenRednet() end)
   MAINT.safeBootStep("timer", function() startTimer() end)
