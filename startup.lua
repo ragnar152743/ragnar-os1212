@@ -3,7 +3,7 @@
 -- Everything important is clickable. Text fields still use the keyboard.
 
 local OS_NAME = "SecureClickOS"
-local VERSION = "1.16.1"
+local VERSION = "1.16.2"
 local ROOT = "/secureos"
 local STARTUP_PATH = "/startup.lua"
 local RECOVERY_DIR = "/.secureclickos"
@@ -2518,6 +2518,7 @@ local function appDesktop()
         { header = "Systeme" },
         { id = "mail", label = "Mail" .. (unread > 0 and (" (" .. unread .. ")") or ""), color = colors.cyan },
         { id = "files", label = "Fichiers", color = colors.green },
+        { id = "downloader", label = "Telechargeur", color = colors.lightBlue },
         { id = "appcenter", label = "Apps/Jeux", color = colors.lime },
         { id = "bank", label = "Banque", color = colors.green },
         { id = "server", label = config.serverMode and "Serveur ON" or "Serveur", color = config.serverMode and colors.lime or colors.orange },
@@ -5889,6 +5890,98 @@ function appFiles()
   end
 end
 
+function appDownloader()
+  if not isValidSession() then return "lock" end
+  if currentUser and currentUser.guest then
+    messageBox("Telechargeur", { "Mode invite refuse." })
+    return
+  end
+  local action, fields = inputForm("Telecharger .lua", {
+    { key = "url", label = "URL https .lua", maxLen = 180 }
+  }, {
+    { id = "download", label = "Download", color = theme.good, fg = colors.black },
+    { id = "cancel", label = "Cancel", color = theme.bad, fg = colors.white }
+  })
+  if action == "auto_lock" then return "auto_lock" end
+  if action ~= "download" then return end
+
+  local url = tostring(fields[1].value or ""):gsub("%s+", "")
+  if not url:match("^https?://") then
+    messageBox("Refuse", { "URL invalide.", "Utilise http:// ou https://." })
+    return
+  end
+  local urlPath = url:gsub("[?#].*$", "")
+  local fileName = safeFileName(urlPath:match("([^/]+)$") or "")
+  if not fileName or not fileName:lower():match("%.lua$") then
+    messageBox("Refuse", { "Seulement les fichiers .lua.", "L'URL doit finir par .lua." })
+    return
+  end
+
+  MAINT.enableInternetAuto()
+  if not http or type(http.get) ~= "function" then
+    messageBox("Internet OFF", { "HTTP indisponible.", "Active HTTP cote serveur/modpack." })
+    return
+  end
+  local ok, response, err = pcall(http.get, url)
+  if not ok or not response then
+    messageBox("Erreur", { "Telechargement impossible.", truncate(tostring(err or response or ""), w - 4) })
+    return
+  end
+  local code = response.getResponseCode and response.getResponseCode() or 200
+  local source = response.readAll and response.readAll() or ""
+  if response.close then response.close() end
+  if tonumber(code) and tonumber(code) >= 400 then
+    messageBox("Erreur HTTP", { "Code: " .. tostring(code) })
+    return
+  end
+  if source == "" then
+    messageBox("Refuse", { "Fichier vide." })
+    return
+  end
+  if #source > RUNNER.MAX_SOURCE_LEN then
+    messageBox("Refuse", { "Programme trop gros.", "Max: " .. tostring(RUNNER.MAX_SOURCE_LEN) .. " caracteres." })
+    return
+  end
+  if source:sub(1, 4) == "\27Lua" then
+    messageBox("Refuse", { "Bytecode Lua refuse.", "Texte .lua seulement." })
+    return
+  end
+
+  local chunk, syntaxErr
+  if loadstring then
+    chunk, syntaxErr = loadstring(source, "@" .. fileName)
+  elseif load then
+    chunk, syntaxErr = load(source, "@" .. fileName, "t", {})
+  else
+    messageBox("Erreur", { "loadstring indisponible." })
+    return
+  end
+  if not chunk then
+    messageBox("Erreur Lua", { truncate(tostring(syntaxErr), w - 4) })
+    return
+  end
+
+  local dir = FILES_DIR .. "/" .. currentUser.name
+  ensureDir(dir)
+  local savedName = uniqueFileName(dir, fileName)
+  if not writePrivateFile(dir .. "/" .. savedName, source) then
+    messageBox("Erreur", { "Impossible d'enregistrer." })
+    return
+  end
+  appendAudit("downloaded lua app: " .. tostring(savedName))
+  local nextAction = messageBox("Telecharge", {
+    "Fichier: " .. savedName,
+    "Sauve dans Fichiers.",
+    "Il apparaitra dans le menu Lua."
+  }, {
+    { id = "run", label = "Run", color = theme.good, fg = colors.black },
+    { id = "ok", label = "OK", color = theme.action, fg = colors.black }
+  })
+  if nextAction == "run" then
+    return RUNNER.runLuaFile(savedName)
+  end
+end
+
 function changeOwnPassword()
   local a, f = inputForm("Changer mot de passe", {
     { key = "old", label = "Ancien", mask = true, maxLen = MAX_PASSWORD_LEN },
@@ -6297,6 +6390,7 @@ function appHelp()
       "- verrouillage automatique",
       "- fichiers prives chiffres + MAC anti-modif",
       "- menu deroulant pour lancer les apps .lua",
+      "- telechargeur HTTPS limite aux fichiers .lua",
       "- lancement .lua en sandbox avec rednet + GPS limite",
       "- sandbox sans fs/shell reels ni acces disque systeme",
       "- clic droit app: info, masquer, admin trusted",
@@ -6523,6 +6617,7 @@ function main()
     local result = nil
     if choice == "mail" then result = MAINT.runAppGuard("mail", appMail)
     elseif choice == "files" then result = MAINT.runAppGuard("files", appFiles)
+    elseif choice == "downloader" then result = MAINT.runAppGuard("downloader", appDownloader)
     elseif choice == "security" then result = MAINT.runAppGuard("security", appSecurity)
     elseif choice == "settings" then result = MAINT.runAppGuard("settings", appSettings)
     elseif choice == "help" then result = MAINT.runAppGuard("help", appHelp)
